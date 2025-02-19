@@ -38,7 +38,8 @@ from reNgine.definitions import (
 	NUCLEI_SEVERITY_MAP,
 	DEFAULT_GPT_MODELS,
 	RUNNING_TASK,
-	SUCCESS_TASK
+	SUCCESS_TASK,
+	ENGINE_NAMES
 )
 from reNgine.settings import (
 	RENGINE_CURRENT_VERSION,
@@ -169,7 +170,6 @@ class OllamaManager(APIView):
                 defaults={
                     'selected_model': model_name,
                     'use_ollama': use_ollama,
-                    'selected': True
                 }
             )
             return Response({'status': True})
@@ -202,7 +202,11 @@ class GPTAttackSuggestion(APIView):
 			})
 
 		ip_addrs = subdomain.ip_addresses.all()
-		open_ports = ', '.join(f'{port.number}/{port.service_name}' for ip in ip_addrs for port in ip.ports.all())
+		open_ports = ', '.join(
+			f'{port.number}/{port.service_name}'
+			for ip in ip_addrs
+			for port in ip.ports.all()
+		)
 		tech_used = ', '.join(tech.name for tech in subdomain.technologies.all())
 
 		input_data = f'''
@@ -508,14 +512,14 @@ class FetchMostVulnerable(APIView):
 					.exclude(vuln_count=0)[:limit]
 				)
 
-				if most_vulnerable_subdomains:
-					response['status'] = True
-					response['result'] = (
-						SubdomainSerializer(
-							most_vulnerable_subdomains,
-							many=True)
-						.data
-					)
+			if most_vulnerable_subdomains:
+				response['status'] = True
+				response['result'] = (
+					SubdomainSerializer(
+						most_vulnerable_subdomains,
+						many=True)
+					.data
+				)
 
 		elif target_id:
 			subdomain_query = subdomains.filter(target_domain__id=target_id)
@@ -1325,7 +1329,7 @@ class GetFileContents(APIView):
 			return Response(response)
 
 		if 'amass_config' in req.query_params:
-			path = str(Path.home() / ".config" / "amass.ini")
+			path = str(Path.home() / ".config" / "amass" / "config.ini")
 			if not os.path.exists(path):
 				run_command(f'touch {path}')
 				response['message'] = 'File Created!'
@@ -1362,7 +1366,7 @@ class GetFileContents(APIView):
 			return Response(response)
 
 		if 'gau_config' in req.query_params:
-			path = str(Path.home() / ".config" / '.gau.toml')
+			path = str(Path.home() / ".config" / 'gau' / 'config.toml')
 			if not os.path.exists(path):
 				run_command(f'touch {path}')
 				response['message'] = 'File Created!'
@@ -1423,11 +1427,14 @@ class ListScanHistory(APIView):
 
 
 class ListEngines(APIView):
-	def get(self, request, format=None):
-		req = self.request
-		engines = EngineType.objects.order_by('engine_name').all()
-		engine_serializer = EngineSerializer(engines, many=True)
-		return Response({'engines': engine_serializer.data})
+    def get(self, request):
+        if engine_id := request.GET.get('engine_id'):
+            engines = EngineType.objects.filter(id=engine_id)
+        else:
+            engines = EngineType.objects.all()
+
+        serializer = EngineSerializer(engines.order_by('engine_name'), many=True)
+        return Response({'engines': serializer.data})
 
 
 class ListOrganizations(APIView):
@@ -1584,32 +1591,42 @@ class ListEmployees(APIView):
 
 
 class ListPorts(APIView):
-	def get(self, request, format=None):
-		req = self.request
-		scan_id = safe_int_cast(req.query_params.get('scan_id'))
-		target_id = safe_int_cast(req.query_params.get('target_id'))
-		ip_address = req.query_params.get('ip_address')
+    def get(self, request, format=None):
+        req = self.request
+        scan_id = safe_int_cast(req.query_params.get('scan_id'))
+        target_id = safe_int_cast(req.query_params.get('target_id'))
+        ip_address = req.query_params.get('ip_address')
 
-		if target_id:
-			port = Port.objects.filter(
-				ports__in=IpAddress.objects.filter(
-					ip_addresses__in=Subdomain.objects.filter(
-						target_domain__id=target_id))).distinct()
-		elif scan_id:
-			port = Port.objects.filter(
-				ports__in=IpAddress.objects.filter(
-					ip_addresses__in=Subdomain.objects.filter(
-						scan_history__id=scan_id))).distinct()
-		else:
-			port = Port.objects.filter(
-				ports__in=IpAddress.objects.filter(
-					ip_addresses__in=Subdomain.objects.all())).distinct()
+        # Build the base query
+        port_query = Port.objects.all()
 
-		if ip_address:
-			port = port.filter(ports__address=ip_address).distinct()
+        # Filter based on parameters
+        if target_id:
+            port_query = port_query.filter(
+                ports__ip_subscan_ids__target_domain__id=target_id
+            )
+        elif scan_id:
+            port_query = port_query.filter(
+                ports__ip_subscan_ids__scan_history__id=scan_id
+            )
 
-		serializer = PortSerializer(port, many=True)
-		return Response({"ports": serializer.data})
+        if ip_address:
+            port_query = port_query.filter(
+                ports__address=ip_address
+            )
+
+        # Grouping information
+        ports_data = []
+        ports_data.extend(
+            {
+                'number': port.number,
+                'service_name': port.service_name,
+                'description': port.description,
+                'is_uncommon': port.is_uncommon,
+            }
+            for port in port_query.distinct()
+        )
+        return Response({"ports": ports_data})
 
 
 class ListSubdomains(APIView):
@@ -1639,9 +1656,8 @@ class ListSubdomains(APIView):
 
 		if port:
 			subdomain_query = subdomain_query.filter(
-				ip_addresses__in=IpAddress.objects.filter(
-					ports__in=Port.objects.filter(
-						number=port)))
+				ip_addresses__ports__number=port
+			).distinct('name')
 
 		if 'only_important' in req.query_params:
 			subdomain_query = subdomain_query.filter(is_important=True)
@@ -2053,6 +2069,12 @@ class SubdomainDatatableViewSet(viewsets.ModelViewSet):
 		if name:
 			self.queryset = self.queryset.filter(name=name)
 
+		# Prefetching necessary relations for get_ports_by_ip
+		self.queryset = self.queryset.prefetch_related(
+			'ip_addresses',
+			'ip_addresses__ports',
+		)
+		
 		return self.queryset
 
 	def filter_queryset(self, qs):
@@ -2892,3 +2914,49 @@ class VulnerabilityViewSet(viewsets.ModelViewSet):
 					print(e)
 
 		return qs
+
+class GetIpDetails(APIView):
+    def get(self, request, format=None):
+        req = self.request
+        ip_address = req.query_params.get('ip_address')
+        scan_id = safe_int_cast(req.query_params.get('scan_id'))
+        target_id = safe_int_cast(req.query_params.get('target_id'))
+
+        if not ip_address:
+            return Response({"error": "IP address is required"}, status=400)
+
+        # Build the base query
+        ip_query = IpAddress.objects.filter(address=ip_address)
+
+        if scan_id:
+            ip_query = ip_query.filter(
+                ip_addresses__scan_history__id=scan_id
+            )
+        elif target_id:
+            ip_query = ip_query.filter(
+                ip_addresses__target_domain__id=target_id
+            )
+
+        # Preloading relations to optimize performance
+        ip_query = ip_query.prefetch_related(
+            'ports',
+            'ip_addresses',
+        ).distinct()
+
+
+        if not ip_query.exists():
+            return Response({"error": "IP not found"}, status=404)
+            
+        serializer = IpSerializer(
+            ip_query.first(), 
+            context={'scan_id': scan_id}
+        )
+        return Response(serializer.data)
+
+class UncommonWebPortsView(APIView):
+    def get(self, request):
+        from reNgine.definitions import UNCOMMON_WEB_PORTS
+        return Response({
+            'uncommon_web_ports': UNCOMMON_WEB_PORTS,
+            'common_web_ports': [80, 443]
+        })
