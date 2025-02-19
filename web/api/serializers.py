@@ -9,6 +9,7 @@ from scanEngine.models import *
 from startScan.models import *
 from targetApp.models import *
 from dashboard.models import *
+import yaml
 
 
 class SearchHistorySerializer(serializers.ModelSerializer):
@@ -232,20 +233,23 @@ class OrganizationSerializer(serializers.ModelSerializer):
 
 class EngineSerializer(serializers.ModelSerializer):
 
-	tasks = serializers.SerializerMethodField('get_tasks')
+	tasks = serializers.SerializerMethodField()
 
-	def get_tasks(self, instance):
-		return instance.tasks
+	def get_tasks(self, obj):
+		try:
+			yaml_config = yaml.safe_load(obj.yaml_configuration)
+			if not isinstance(yaml_config, dict):
+				return []
+		except Exception:
+			return []
+		return sorted([
+			task for task in yaml_config.keys()
+			if task in ENGINE_NAMES
+		])
 
 	class Meta:
 		model = EngineType
-		fields = [
-			'id',
-			'default_engine',
-			'engine_name',
-			'yaml_configuration',
-			'tasks'
-		]
+		fields = ['id', 'engine_name', 'tasks']
 
 
 class OrganizationTargetsSerializer(serializers.ModelSerializer):
@@ -272,27 +276,6 @@ class VisualiseVulnerabilitySerializer(serializers.ModelSerializer):
 		return vulnerability.name
 
 
-class VisualisePortSerializer(serializers.ModelSerializer):
-
-	description = serializers.SerializerMethodField('get_description')
-	title = serializers.SerializerMethodField('get_title')
-
-	class Meta:
-		model = Port
-		fields = [
-			'description',
-			'is_uncommon',
-			'title',
-		]
-
-	def get_description(self, port):
-		return str(port.number) + "/" + str(port.service_name)
-
-	def get_title(self, port):
-		if port.is_uncommon:
-			return "Uncommon Port"
-
-
 class VisualiseTechnologySerializer(serializers.ModelSerializer):
 
 	description = serializers.SerializerMethodField('get_description')
@@ -306,29 +289,41 @@ class VisualiseTechnologySerializer(serializers.ModelSerializer):
 	def get_description(self, tech):
 		return tech.name
 
+class VisualisePortSerializer(serializers.ModelSerializer):
+    description = serializers.SerializerMethodField()
+    title = serializers.SerializerMethodField()
+    is_uncommon = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Port
+        fields = ['description', 'title', 'is_uncommon']
+
+    def get_description(self, port):
+        return f"{port.number}/{port.service_name}/{port.service_name}"
+
+    def get_title(self, port):
+        if port.is_uncommon:
+            return "Uncommon Port"
+        return "Port"
+
+    def get_is_uncommon(self, port):
+        return port.is_uncommon
 
 class VisualiseIpSerializer(serializers.ModelSerializer):
+    description = serializers.SerializerMethodField('get_description')
+    children = serializers.SerializerMethodField('get_children')
 
-	description = serializers.SerializerMethodField('get_description')
-	children = serializers.SerializerMethodField('get_children')
+    class Meta:
+        model = IpAddress
+        fields = ['description', 'children']
 
-	class Meta:
-		model = IpAddress
-		fields = [
-			'description',
-			'children'
-		]
+    def get_description(self, ip):
+        return ip.address
 
-	def get_description(self, Ip):
-		return Ip.address
-
-	def get_children(self, ip):
-		port = Port.objects.filter(
-			ports__in=IpAddress.objects.filter(
-				address=ip))
-		serializer = VisualisePortSerializer(port, many=True)
-		return serializer.data
-
+    def get_children(self, ip):
+        ports = ip.ports.all()
+        serializer = VisualisePortSerializer(ports, many=True)
+        return serializer.data
 
 class VisualiseEndpointSerializer(serializers.ModelSerializer):
 
@@ -376,7 +371,11 @@ class VisualiseSubdomainSerializer(serializers.ModelSerializer):
 		)
 
 		ips = IpAddress.objects.filter(ip_addresses__in=subdomains)
-		ip_serializer = VisualiseIpSerializer(ips, many=True)
+		ip_serializer = VisualiseIpSerializer(
+			ips, 
+			many=True,
+			context={'scan_id': scan_history.id}
+		)
 
 		# endpoint = EndPoint.objects.filter(
 		#     scan_history=self.context.get('scan_history')).filter(
@@ -816,12 +815,31 @@ class PortSerializer(serializers.ModelSerializer):
 
 
 class IpSerializer(serializers.ModelSerializer):
+    ports = PortSerializer(many=True)
+    subdomain_count = serializers.SerializerMethodField()
+    subdomain_names = serializers.SerializerMethodField()
 
-	ports = PortSerializer(many=True)
+    class Meta:
+        model = IpAddress
+        fields = '__all__'
 
-	class Meta:
-		model = IpAddress
-		fields = '__all__'
+    def get_base_subdomain_query(self, obj):
+        query = Subdomain.objects.filter(ip_addresses=obj)
+        scan_id = self.context.get('scan_id')
+        target_id = self.context.get('target_id')
+        
+        if scan_id:
+            query = query.filter(scan_history_id=scan_id)
+        elif target_id:
+            query = query.filter(target_domain_id=target_id)
+            
+        return query.distinct('name')
+
+    def get_subdomain_count(self, obj):
+        return self.get_base_subdomain_query(obj).count()
+
+    def get_subdomain_names(self, obj):
+        return list(self.get_base_subdomain_query(obj).values_list('name', flat=True))
 
 
 class DirectoryFileSerializer(serializers.ModelSerializer):
